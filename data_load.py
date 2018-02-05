@@ -1,144 +1,140 @@
 # -*- coding: utf-8 -*-
-# /usr/bin/python2
+#/usr/bin/python2
+'''
+By kyubyong park. kbpark.linguist@gmail.com.
+https://www.github.com/kyubyong/cross_vc
+'''
 
-import glob
-
-import tensorflow as tf
+from __future__ import print_function
 
 from hparams import Hyperparams as hp
+import numpy as np
+import tensorflow as tf
 from utils import *
+import codecs
+import re
+import os, glob
+import tqdm
 
 
-def load_data(mode):
+
+def load_vocab():
+    phn2idx = {phn: idx for idx, phn in enumerate(hp.vocab)}
+    idx2phn = {idx: phn for idx, phn in enumerate(hp.vocab)}
+    return phn2idx, idx2phn
+
+def load_data(mode="train1"):
     if mode in ("train1", "eval1"):
-        lengths, mfccs, phones = [], [], [] # file paths
-        files = glob.glob('nick/phns/*.npy') + glob.glob('timit/phns/*.npy')
+        wav_fpaths = glob.glob(hp.timit)
+        # wav_fpaths = [w for w in wav_fpaths if 'TEST/DR1/FAKS' not in w]
+        phn_fpaths = [f.replace("WAV.wav", "PHN").replace("wav", 'PHN')
+                      for f in wav_fpaths]
         if mode=="train1":
-            files = files[hp.batch_size:]
+            return wav_fpaths[hp.batch_size:], phn_fpaths[hp.batch_size:]
         else:
-            files = files[:hp.batch_size]
+            wav_fpaths, phn_fpaths = wav_fpaths[:hp.batch_size], phn_fpaths[:hp.batch_size]
 
-        for f in files:
-            lengths.append(len(np.load(f))) # frame length T
-            phones.append(f)
-            mfccs.append(f.replace('phns', 'mfccs'))
-        return lengths, mfccs, phones # file paths
+            mfccs = np.zeros((hp.batch_size, 1500, hp.n_mfccs), np.float32)
+            phns = np.zeros((hp.batch_size, 1500), np.int32)
+            max_length = 0
+            for i, (w, p) in enumerate(zip(wav_fpaths, phn_fpaths)):
+                mfcc, phone = load_mfccs_and_phones(w, p)
+                max_length = max(max_length, len(mfcc))
+                mfccs[i, :len(mfcc), :] = mfcc
+                phns[i, :len(phone)] = phone
+            mfccs = mfccs[:, :max_length, :]
+            phns = phns[:, :max_length]
 
-    elif mode in ("train2", "eval2"):
-        lengths, mfccs, mels, mags = [], [], [], [] # file paths
-        files = glob.glob('{}/mfccs/*.npy'.format(hp.data))
-        if mode=="train2":
-            files = files[hp.batch_size:]
-        else:
-            files = files[:hp.batch_size]
-            print("eval files=", files)
+            return mfccs, phns
 
-        for f in files:
-            length = len(np.load(f))
-            # print(length)
-            if length>800:
-                if mode=="eval2":
-                    print "skipped {}".format(f)
-                continue
-            lengths.append(length)
-            mfccs.append(f)
-            mels.append(f.replace('mfccs', 'mels'))
-            mags.append(f.replace('mfccs', 'mags'))
-        print(len(lengths))
-        return lengths, mfccs, mels, mags
-    else: # convert -> numpy arrays
-        lengths, mfccs = [], []
-        files = glob.glob('50lang/*.wav')
-        for f in files:
-            mfcc, _, _ = get_audio_features(f)
-            lengths.append(len(mfcc))
-            mfccs.append(mfcc)
+    elif mode=="train2":
+        wav_fpaths = glob.glob(hp.arctic)
+        return wav_fpaths
 
-        return lengths, mfccs
+    else: # convert
+        files = glob.glob(hp.test_data)
+        mfccs = np.zeros((len(files), 800, hp.n_mfccs), np.float32)
+        for i, f in enumerate(files):
+            mfcc, _ = get_mfcc_and_mag(f, trim=True)
+            mfcc = mfcc[:800]
+            mfccs[i, :len(mfcc), :] = mfcc
+        return mfccs
 
-def get_batch_queue(mode):
+def load_mfccs_and_phones(wav_fpath, phn_fpath):
+    phn2idx, idx2phn = load_vocab()
+    mfccs, _ = get_mfcc_and_mag(wav_fpath, trim=False)
+    phns = np.zeros(shape=(mfccs.shape[0],), dtype=np.int32)
+
+    # phones
+    phones = [line.strip().split()[-1] for line in open(phn_fpath, 'r')]
+
+    triphones = []
+    for a, b, c in zip(["0"] + phones[:-1], phones, phones[1:] + ["0"]):
+        triphones.append((a, b, c))
+
+    for i, line in enumerate(open(phn_fpath, 'r')):
+        start_point, _, phn = line.strip().split()
+        bnd = int(start_point) // int(hp.sr * hp.frame_shift)  # the ordering number of frames
+
+        triphone = triphones[i]
+        if triphone in phn2idx:
+            phn = phn2idx[triphone]
+        elif phn in phn2idx:
+            phn = phn2idx[phn]
+        else: # error
+            print(phn)
+        phns[bnd:] = phn
+    return mfccs, phns
+
+def get_batch(mode="train1"):
     '''Loads data and put them in mini batch queues.
     mode: A string. Either `train1` or `train2`.
     '''
-    with tf.device('/cpu:0'):
-        # Load data
-        if mode=='train1':
-            lengths, mfccs, phones = load_data(mode=mode)
-            maxlen, minlen = max(lengths), min(lengths)
+    # with tf.device('/cpu:0'):
+    # Load data
+    if mode=='train1':
+        wav_fpaths, phn_fpaths = load_data(mode=mode)
 
-            # calc total batch count
-            num_batch = len(mfccs) // hp.batch_size
+        # calc total batch count
+        num_batch = len(wav_fpaths) // hp.batch_size
 
-            # Convert to tensor
-            lengths = tf.convert_to_tensor(lengths)
-            mfccs = tf.convert_to_tensor(mfccs)
-            phones = tf.convert_to_tensor(phones)
+        # Create Queues
+        wav_fpath, phn_fpath = tf.train.slice_input_producer([wav_fpaths, phn_fpaths], shuffle=True)
 
-            # Create Queues
-            length, mfcc, phone = tf.train.slice_input_producer([lengths, mfccs, phones], shuffle=True)
+        # Decoding
+        mfccs, phones = tf.py_func(load_mfccs_and_phones, [wav_fpath, phn_fpath], [tf.float32, tf.int32])  # (T, n_mfccs)
 
-            # Decoding
-            mfcc = tf.py_func(lambda x: np.load(x), [mfcc], tf.float32)  # (T, n_mfccs)
-            phone = tf.py_func(lambda x: np.load(x), [phone], tf.int32)  # (T,)
+        # Create batch queues
+        mfccs, phones, wav_fpaths = tf.train.batch([mfccs, phones, wav_fpath],
+                                       batch_size=hp.batch_size,
+                                       num_threads=32,
+                                       shapes=[(None, hp.n_mfccs), (None,), ()],
+                                       dynamic_pad=True)
 
-            # Set shapes
-            mfcc.set_shape([None, hp.n_mfccs])
-            phone.set_shape([None,])
+        return mfccs, phones, num_batch, wav_fpaths
 
-            # Create batch queues
-            _, (mfccs, phones) = tf.contrib.training.bucket_by_sequence_length(
-                                                input_length=length,
-                                                tensors=[mfcc, phone],
-                                                batch_size=hp.batch_size,
-                                                bucket_boundaries=[i for i in range(minlen+1, maxlen-1, 50)],
-                                                num_threads=16,
-                                                capacity=hp.batch_size * 4,
-                                                dynamic_pad=True)
+    elif mode=='train2':
+        wav_fpaths = load_data(mode=mode)
+        # maxlen, minlen = max(lengths), min(lengths)
 
-            return mfccs, phones, num_batch
+        # calc total batch count
+        num_batch = len(wav_fpaths) // hp.batch_size
 
-        elif mode=='train2':
-            lengths, mfccs, mels, mags = load_data(mode=mode)
-            maxlen, minlen = max(lengths), min(lengths)
+        # Create Queues
+        wav_fpath, = tf.train.slice_input_producer([wav_fpaths])
 
-            # calc total batch count
-            num_batch = len(mfccs) // hp.batch_size
+        # Decoding
+        mfcc, mag = tf.py_func(get_mfcc_and_mag, [wav_fpath], [tf.float32, tf.float32])  # (T, n_mfccs)
 
-            # Convert to tensor
-            lengths = tf.convert_to_tensor(lengths)
-            mfccs = tf.convert_to_tensor(mfccs)
-            mels = tf.convert_to_tensor(mels)
-            mags = tf.convert_to_tensor(mags)
+        # Cropping
+        mfcc = mfcc[:hp.maxlen]
+        mag = mag[:hp.maxlen]
 
-            # Create Queues
-            length, mfcc, mel, mag = tf.train.slice_input_producer([lengths, mfccs, mels, mags], shuffle=True)
+        # Create batch queues
+        mfccs, mags = tf.train.batch([mfcc, mag],
+                                       batch_size=hp.batch_size,
+                                       num_threads=32,
+                                       shapes=[(None, hp.n_mfccs), (None, 1+hp.n_fft//2)],
+                                       dynamic_pad=True)
 
-            # Decoding
-            mfcc = tf.py_func(lambda x: np.load(x), [mfcc], tf.float32)  # (T, n_mfccs)
-            mel = tf.py_func(lambda x: np.load(x), [mel], tf.float32)  # (T,)
-            mag = tf.py_func(lambda x: np.load(x), [mag], tf.float32)  # (T,)
-
-            # exp
-            def dicretize(mag, num_bins=100):
-                bins = np.logspace(-1, 0, num_bins-1, base=10)
-                mag = np.digitize(mag, bins).astype(np.int32)
-                return mag
-
-            # mag = tf.py_func(dicretize, [mag], tf.int32)
-
-            # Set shapes
-            mfcc.set_shape([None, hp.n_mfccs])
-            mel.set_shape([None, hp.n_mels])
-            mag.set_shape([None, hp.n_fft//2+1])
-
-            # Create batch queues
-            _, (mfccs, mels, mags) = tf.contrib.training.bucket_by_sequence_length(
-                                                input_length=length,
-                                                tensors=[mfcc, mel, mag],
-                                                batch_size=hp.batch_size,
-                                                bucket_boundaries=[i for i in range(minlen+1, maxlen-1, 50)],
-                                                num_threads=16,
-                                                capacity=hp.batch_size * 4,
-                                                dynamic_pad=True)
-
-            return mfccs, mels, mags, num_batch
+        return mfccs, mags, num_batch
