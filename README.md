@@ -2,9 +2,9 @@
 
 I wish I could speak many languages. Wait. Actually I do. But only 4 or 5 languages with limited proficiency. Instead, can I create a voice model that can copy any voice in any language? Possibly! A while ago, me and my colleage [Dabi](https://github.com/andabi/deep-voice-conversion) opened a simple voice conversion project. Based on it, I expanded the idea to cross-languages. I found it's very challenging with my limited knowledge. Unfortunately, the results I have for now are not good, but hopefully it will be helpful for some people. 
 
-February 2018<br>
-Author: [Kyubyong Park](kbpark.linguist@gmail.com)
-Version: 1.0
+<div style="text-align: right">February 2018</div>
+<div style="text-align: right">Author: Kyubyong Park (kbpark.linguist@gmail.com)</div>
+<div style="text-align: right">Version: 1.0</div>
 
 ## Requirements
   * NumPy >= 1.11.1
